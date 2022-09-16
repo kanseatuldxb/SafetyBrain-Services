@@ -1,0 +1,189 @@
+from flask import Flask
+from flask import request
+from flask import jsonify
+from flask import json
+import json, base64, hashlib, os, struct, time
+from datetime import datetime
+import numpy as np
+import cv2
+
+from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
+from tensorflow.keras.preprocessing.image import img_to_array
+from tensorflow.keras.models import load_model
+
+DEBUG = True
+
+port = int(os.environ.get('PORT', 8080))
+
+
+
+
+def debug(msg):
+    if DEBUG:
+        print(msg)
+
+
+with open('yolo/class.names') as f:
+    labels = [line.strip() for line in f]
+
+debug('List with labels names:')
+debug(labels)
+
+network = cv2.dnn.readNetFromDarknet('yolo/yolov3_ppe_test.cfg','yolo/yolov3_train_ppe.weights')
+
+layers_names_all = network.getLayerNames()
+
+
+layers_names_output = [layers_names_all[i - 1] for i in network.getUnconnectedOutLayers()]
+
+probability_minimum = 0.6
+
+threshold = 0.6
+
+colours = np.random.randint(0, 255, size=(len(labels), 3), dtype='uint8')
+
+debug(colours)
+debug(type(colours))
+colours= np.asarray([[0xa0,0xd6,0x06],[0x6f,0x47,0xef],[0xa0,0xd6,0x06],[0x6f,0x47,0xef],[0x6f,0x47,0xef],[0x6f,0x47,0xef],[0xa0,0xd6,0x06],[0xa0,0xd6,0x06]])
+
+debug(np.asarray(colours))
+debug(type(colours))
+
+debug("[INFO] loading face detector model...")
+prototxtPath = "models/face_detector/deploy.prototxt"#os.path.sep.join([args["face"], "deploy.prototxt"]) #
+weightsPath = "models/face_detector/res10_300x300_ssd_iter_140000.caffemodel"
+net = cv2.dnn.readNet(prototxtPath, weightsPath)
+
+# load the face mask detector model from disk
+debug("[INFO] loading face mask detector model...")
+model = load_model("models/mask_detector.model")
+
+def ReadBase64Image(uri):
+    encoded_data = uri.split(',')[1]
+    nparr = np.fromstring(base64.b64decode(encoded_data), np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    return img
+
+def DetectPPE(Base64Image):
+    frame=ReadBase64Image(Base64Image)
+    print("I am Here")
+    #debug(os.path.join ('/media/', imagepath))
+    #frame = cv2.imread(os.path.join ('media/', imagepath))
+    h, w = frame.shape[:2]
+
+    blob = cv2.dnn.blobFromImage(frame, 1 / 255.0, (416, 416), swapRB=True, crop=False)
+
+    network.setInput(blob)
+    start = time.time()
+    output_from_network = network.forward(layers_names_output)
+    end = time.time()
+
+    bounding_boxes = []
+    confidences = []
+    class_numbers = []
+
+
+    isHatPresent = False;
+    isGlovesPresent = False;
+    isVestPresent = False;
+    isBootPresent = False;
+    isGlassesPresent = False;
+    isMaskPresent = False;
+
+    image = frame.copy()
+
+    for result in output_from_network:
+        for detected_objects in result:
+            scores = detected_objects[5:]
+            class_current = np.argmax(scores)
+            confidence_current = scores[class_current]
+            if confidence_current > probability_minimum:
+                box_current = detected_objects[0:4] * np.array([w, h, w, h])
+                x_center, y_center, box_width, box_height = box_current
+                x_min = int(x_center - (box_width / 2))
+                y_min = int(y_center - (box_height / 2))
+                bounding_boxes.append([x_min, y_min,int(box_width), int(box_height)])
+                confidences.append(float(confidence_current))
+                class_numbers.append(class_current)
+    results = cv2.dnn.NMSBoxes(bounding_boxes, confidences, probability_minimum, threshold)
+    debug(results)
+    if len(results) > 0:
+        for i in results.flatten():
+            x_min, y_min = bounding_boxes[i][0], bounding_boxes[i][1]
+            box_width, box_height = bounding_boxes[i][2], bounding_boxes[i][3]
+            colour_box_current = colours[class_numbers[i]].tolist()
+            debug(i)
+            if(class_numbers[i] == 0):
+                isHatPresent = True
+            if(class_numbers[i] == 2):
+                isVestPresent = True
+            if(class_numbers[i] == 6):
+                isGlassesPresent = True
+            if(class_numbers[i] == 7):
+                isGlovesPresent = True
+            cv2.rectangle(frame, (x_min, y_min),(x_min + box_width, y_min + box_height),colour_box_current, 10)
+            text_box_current = '{}: {:.1f} %'.format(labels[int(class_numbers[i])], confidences[i]* 100)
+            debug(text_box_current)
+            cv2.putText(frame, text_box_current, (x_min, y_min - 10), cv2.FONT_HERSHEY_SIMPLEX, 2, colour_box_current, 8)
+    orig = image.copy()
+    (h, w) = image.shape[:2]
+    blob = cv2.dnn.blobFromImage(image, 1.0, (300, 300),(104.0, 177.0, 123.0))
+    debug("[INFO] computing face detections...")
+    net.setInput(blob)
+    detections = net.forward()
+    for i in range(0, detections.shape[2]):
+        confidence = detections[0, 0, i, 2]
+        if confidence > 0.5:
+            box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
+            (startX, startY, endX, endY) = box.astype("int")
+            (startX, startY) = (max(0, startX), max(0, startY))
+            (endX, endY) = (min(w - 1, endX), min(h - 1, endY))
+            face = image[startY:endY, startX:endX]
+            face = cv2.cvtColor(face, cv2.COLOR_BGR2RGB)
+            face = cv2.resize(face, (224, 224))
+            face = img_to_array(face)
+            face = preprocess_input(face)
+            face = np.expand_dims(face, axis=0)
+            (mask, withoutMask) = model.predict(face)[0]
+            labelx = "Mask" if mask > withoutMask else "No Mask"
+            color = (0, 255, 0) if labelx == "Mask" else (0, 0, 255)
+            label = "{}: {:.1f}%".format(labelx, max(mask, withoutMask) * 100)
+            if labelx == "No Mask":
+                cv2.putText(frame, label, (startX, startY - 10),cv2.FONT_HERSHEY_SIMPLEX, 2, (0x6f,0x47,0xef), 8)
+                cv2.rectangle(frame, (startX, startY), (endX, endY), (0x6f,0x47,0xef), 10)
+                isMaskPresent = False;
+            else:
+                cv2.putText(frame, label, (startX, startY - 10),cv2.FONT_HERSHEY_SIMPLEX, 2, (0xa0,0xd6,0x06), 8)
+                cv2.rectangle(frame, (startX, startY), (endX, endY), (0xa0,0xd6,0x06), 10)
+                isMaskPresent = True;
+
+    retval, buffer = cv2.imencode('.jpg', frame)
+    jpg_as_text = base64.b64encode(buffer)
+    #{"result":jpg_as_text,"isHatPresent":isHatPresent,"isVestPresent":isVestPresent,"isBootPresent":isBootPresent,"isGlassesPresent":isGlassesPresent,"isMaskPresent":isMaskPresent}
+    result = {"result":jpg_as_text.decode("utf-8") ,"Gloves":isGlovesPresent,"Hat":isHatPresent,"Vest":isVestPresent,"Boot":isBootPresent,"Glasses":isGlassesPresent,"Mask":isMaskPresent}
+    #print(result)
+    return result
+
+app = Flask(__name__)
+
+# The route() function of the Flask class is a decorator,
+# which tells the application which URL should call
+# the associated function.
+@app.route('/api/v3/scan/', methods = ['POST'])
+def hello_world():
+    request_data = request.get_json()
+    image = request_data['image']
+    result=DetectPPE(image)
+    response = app.response_class(
+        response=json.dumps(result),
+        status=200,
+        mimetype='application/json'
+    )
+    return response
+    #return jsonify(result)#, indent=4, sort_keys=True)
+
+# main driver function
+if __name__ == '__main__':
+    app.run(debug=True, host='0.0.0.0', port=port)
+
+
